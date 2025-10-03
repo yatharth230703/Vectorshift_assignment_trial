@@ -2,91 +2,130 @@
 
 import json
 import secrets
+import base64
+import os
+import urllib.parse
+import asyncio
+import httpx
+import requests
+
 from fastapi import Request, HTTPException
 from fastapi.responses import HTMLResponse
-import httpx
-import asyncio
-import base64
-import requests
-from integrations.integration_item import IntegrationItem
 
+from dotenv import load_dotenv
+from integrations.integration_item import IntegrationItem
 from redis_client import add_key_value_redis, get_value_redis, delete_key_redis
 
-CLIENT_ID = 'XXX'
-CLIENT_SECRET = 'XXX'
-encoded_client_id_secret = base64.b64encode(f'{CLIENT_ID}:{CLIENT_SECRET}'.encode()).decode()
+load_dotenv()
 
-REDIRECT_URI = 'http://localhost:8000/integrations/notion/oauth2callback'
-authorization_url = f'https://api.notion.com/v1/oauth/authorize?client_id={CLIENT_ID}&response_type=code&owner=user&redirect_uri=http%3A%2F%2Flocalhost%3A8000%2Fintegrations%2Fnotion%2Foauth2callback'
+# --- Config ---
+CLIENT_ID = os.getenv('NOTION_CLIENT_ID')
+CLIENT_SECRET = os.getenv('NOTION_CLIENT_SECRET')
+REDIRECT_URI = "http://localhost:8000/integrations/notion/oauth2callback"
 
+encoded_client_id_secret = base64.b64encode(
+    f"{CLIENT_ID}:{CLIENT_SECRET}".encode()
+).decode()
+
+
+# --- Step 1: Authorization ---
 async def authorize_notion(user_id, org_id):
     state_data = {
-        'state': secrets.token_urlsafe(32),
-        'user_id': user_id,
-        'org_id': org_id
+        "state": secrets.token_urlsafe(32),
+        "user_id": user_id,
+        "org_id": org_id,
     }
-    encoded_state = json.dumps(state_data)
-    await add_key_value_redis(f'notion_state:{org_id}:{user_id}', encoded_state, expire=600)
+    state_json = json.dumps(state_data)
 
-    return f'{authorization_url}&state={encoded_state}'
+    # Save state in Redis
+    await add_key_value_redis(f"notion_state:{org_id}:{user_id}", state_json, expire=600)
 
+    # Encode state + redirect_uri
+    encoded_state = urllib.parse.quote(state_json, safe="")
+    encoded_redirect_uri = urllib.parse.quote(REDIRECT_URI, safe="")
+
+    # Build the correct Notion OAuth URL
+    final_url = (
+        f"https://www.notion.com/oauth2/v2.0/authorize"
+        f"?client_id={CLIENT_ID}"
+        f"&response_type=code"
+        f"&owner=user"
+        f"&redirect_uri={encoded_redirect_uri}"
+        f"&state={encoded_state}"
+    )
+
+    print("DEBUG Notion Auth URL:", final_url)
+    return final_url
+
+
+# --- Step 2: OAuth Callback ---
 async def oauth2callback_notion(request: Request):
-    if request.query_params.get('error'):
-        raise HTTPException(status_code=400, detail=request.query_params.get('error'))
-    code = request.query_params.get('code')
-    encoded_state = request.query_params.get('state')
-    state_data = json.loads(encoded_state)
+    if request.query_params.get("error"):
+        raise HTTPException(status_code=400, detail=request.query_params.get("error"))
 
-    original_state = state_data.get('state')
-    user_id = state_data.get('user_id')
-    org_id = state_data.get('org_id')
+    code = request.query_params.get("code")
+    encoded_state = request.query_params.get("state")
 
-    saved_state = await get_value_redis(f'notion_state:{org_id}:{user_id}')
+    try:
+        state_data = json.loads(urllib.parse.unquote(encoded_state))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid state format")
 
-    if not saved_state or original_state != json.loads(saved_state).get('state'):
-        raise HTTPException(status_code=400, detail='State does not match.')
+    original_state = state_data.get("state")
+    user_id = state_data.get("user_id")
+    org_id = state_data.get("org_id")
 
+    saved_state = await get_value_redis(f"notion_state:{org_id}:{user_id}")
+
+    if not saved_state or original_state != json.loads(saved_state).get("state"):
+        raise HTTPException(status_code=400, detail="State does not match.")
+
+    # Exchange code for token
     async with httpx.AsyncClient() as client:
         response, _ = await asyncio.gather(
             client.post(
-                'https://api.notion.com/v1/oauth/token',
+                "https://api.notion.com/v1/oauth/token",
                 json={
-                    'grant_type': 'authorization_code',
-                    'code': code,
-                    'redirect_uri': REDIRECT_URI
-                }, 
+                    "grant_type": "authorization_code",
+                    "code": code,
+                    "redirect_uri": REDIRECT_URI,
+                },
                 headers={
-                    'Authorization': f'Basic {encoded_client_id_secret}',
-                    'Content-Type': 'application/json',
-                }
+                    "Authorization": f"Basic {encoded_client_id_secret}",
+                    "Content-Type": "application/json",
+                },
             ),
-            delete_key_redis(f'notion_state:{org_id}:{user_id}'),
+            delete_key_redis(f"notion_state:{org_id}:{user_id}"),
         )
 
-    await add_key_value_redis(f'notion_credentials:{org_id}:{user_id}', json.dumps(response.json()), expire=600)
-    
-    close_window_script = """
-    <html>
-        <script>
-            window.close();
-        </script>
-    </html>
-    """
-    return HTMLResponse(content=close_window_script)
+    token_data = response.json()
+    await add_key_value_redis(
+        f"notion_credentials:{org_id}:{user_id}",
+        json.dumps(token_data),
+        expire=600,
+    )
 
+    # Close the popup
+    return HTMLResponse(
+        content="""
+        <html><script>window.close();</script></html>
+        """
+    )
+
+
+# --- Step 3: Retrieve Credentials ---
 async def get_notion_credentials(user_id, org_id):
-    credentials = await get_value_redis(f'notion_credentials:{org_id}:{user_id}')
+    credentials = await get_value_redis(f"notion_credentials:{org_id}:{user_id}")
     if not credentials:
-        raise HTTPException(status_code=400, detail='No credentials found.')
-    credentials = json.loads(credentials)
-    if not credentials:
-        raise HTTPException(status_code=400, detail='No credentials found.')
-    await delete_key_redis(f'notion_credentials:{org_id}:{user_id}')
+        raise HTTPException(status_code=400, detail="No credentials found.")
 
+    credentials = json.loads(credentials)
+    await delete_key_redis(f"notion_credentials:{org_id}:{user_id}")
     return credentials
 
+
+# --- Utility functions for Integration Items ---
 def _recursive_dict_search(data, target_key):
-    """Recursively search for a key in a dictionary of dictionaries."""
     if target_key in data:
         return data[target_key]
 
@@ -103,56 +142,48 @@ def _recursive_dict_search(data, target_key):
                         return result
     return None
 
-def create_integration_item_metadata_object(
-    response_json: str,
-) -> IntegrationItem:
-    """creates an integration metadata object from the response"""
-    name = _recursive_dict_search(response_json['properties'], 'content')
+
+def create_integration_item_metadata_object(response_json: dict) -> IntegrationItem:
+    name = _recursive_dict_search(response_json.get("properties", {}), "content")
     parent_type = (
-        ''
-        if response_json['parent']['type'] is None
-        else response_json['parent']['type']
+        "" if response_json["parent"]["type"] is None else response_json["parent"]["type"]
     )
-    if response_json['parent']['type'] == 'workspace':
-        parent_id = None
-    else:
-        parent_id = (
-            response_json['parent'][parent_type]
-        )
 
-    name = _recursive_dict_search(response_json, 'content') if name is None else name
-    name = 'multi_select' if name is None else name
-    name = response_json['object'] + ' ' + name
+    parent_id = (
+        None if response_json["parent"]["type"] == "workspace" else response_json["parent"][parent_type]
+    )
 
-    integration_item_metadata = IntegrationItem(
-        id=response_json['id'],
-        type=response_json['object'],
+    if not name:
+        name = _recursive_dict_search(response_json, "content") or "multi_select"
+
+    name = response_json["object"] + " " + name
+
+    return IntegrationItem(
+        id=response_json["id"],
+        type=response_json["object"],
         name=name,
-        creation_time=response_json['created_time'],
-        last_modified_time=response_json['last_edited_time'],
+        creation_time=response_json["created_time"],
+        last_modified_time=response_json["last_edited_time"],
         parent_id=parent_id,
     )
 
-    return integration_item_metadata
 
+# --- Step 4: Fetch items from Notion (optional demo) ---
 async def get_items_notion(credentials) -> list[IntegrationItem]:
-    """Aggregates all metadata relevant for a notion integration"""
     credentials = json.loads(credentials)
     response = requests.post(
-        'https://api.notion.com/v1/search',
+        "https://api.notion.com/v1/search",
         headers={
-            'Authorization': f'Bearer {credentials.get("access_token")}',
-            'Notion-Version': '2022-06-28',
+            "Authorization": f'Bearer {credentials.get("access_token")}',
+            "Notion-Version": "2022-06-28",
         },
     )
 
+    items = []
     if response.status_code == 200:
-        results = response.json()['results']
-        list_of_integration_item_metadata = []
+        results = response.json().get("results", [])
         for result in results:
-            list_of_integration_item_metadata.append(
-                create_integration_item_metadata_object(result)
-            )
+            items.append(create_integration_item_metadata_object(result))
+        print(items)
 
-        print(list_of_integration_item_metadata)
-    return
+    return items
