@@ -1,3 +1,7 @@
 node_modules/
 .env
 __pycache__/
+# Virtual environment
+.venv/
+venv/
+env/
