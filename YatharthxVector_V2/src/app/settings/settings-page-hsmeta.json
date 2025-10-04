@@ -1,0 +1,7 @@
+{
+  "uid": "settings-YatharthxVector_V2",
+  "type": "settings",
+  "config": {
+    "entrypoint": "/app/settings/SettingsPage.tsx"
+  }
+}
